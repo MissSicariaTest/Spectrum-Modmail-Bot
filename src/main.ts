@@ -124,6 +124,41 @@ Devvit.configure({
   kvStore: true,
 });
 
+Devvit.addMenuItem({
+  label: "Test modmail Discord webhook",
+  description: "Send a test embed to the configured spectrumModmailWebhook",
+  location: "subreddit",
+  forUserType: "moderator",
+  onPress: async (_event, context) => {
+    try {
+      const subredditName = context.subredditName ?? "";
+      const webhook = await getWebhookUrl(context, subredditName, "modmail");
+      if (!webhook) {
+        context.ui.showToast(
+          "Set spectrumModmailWebhook in app settings, then save changes."
+        );
+        return;
+      }
+
+      await sendDiscordWebhook(webhook, {
+        embeds: [
+          {
+            title: "Spectrum Modmail Bot — Test",
+            description: truncateDescription(
+              `Webhook test from r/${normalizeSubredditName(subredditName) || "unknown"}`
+            ),
+            color: SPECTRUM_BLUE,
+          },
+        ],
+      });
+      context.ui.showToast("Test message sent to Discord.");
+    } catch (error) {
+      console.error("Webhook test failed:", getErrorMessage(error));
+      context.ui.showToast(`Webhook test failed: ${getErrorMessage(error)}`);
+    }
+  },
+});
+
 Devvit.addSettings([
   {
     type: "string",
@@ -358,6 +393,21 @@ function previewText(text: string, maxLength: number = PREVIEW_LENGTH): string {
 
 function normalizeSubredditName(name: string): string {
   return name.replace(/^r\//i, "").trim().toLowerCase();
+}
+
+function resolveEventSubredditName(
+  event: {
+    conversationSubreddit?: { name?: string };
+    destinationSubreddit?: { name?: string };
+  },
+  context: TriggerContext | JobContext
+): string {
+  return (
+    event.conversationSubreddit?.name ??
+    event.destinationSubreddit?.name ??
+    context.subredditName ??
+    ""
+  );
 }
 
 function resolveSubredditGroup(subredditName: string): MonitoredSubreddit | null {
@@ -717,8 +767,7 @@ function buildSubredditReportFields(
 }
 
 async function trackModMailForReport(event: ModMail, context: TriggerContext): Promise<void> {
-  const subredditName =
-    event.conversationSubreddit?.name ?? event.destinationSubreddit?.name ?? "";
+  const subredditName = resolveEventSubredditName(event, context);
   const subreddit = getMonitoredSubredditKey(subredditName);
   if (!subreddit) {
     return;
@@ -1029,7 +1078,9 @@ async function getWebhookUrl(
 
   const webhook = (await context.settings.get(settingName)) as string;
   if (!webhook) {
-    console.error(`No webhook URL configured for setting "${settingName}"`);
+    console.error(
+      `No webhook URL configured for setting "${settingName}". Open app settings and save a Discord webhook URL.`
+    );
     return null;
   }
 
@@ -1093,10 +1144,7 @@ async function getNewAccountWarning(
 }
 
 async function sendModMailToWebhook(event: ModMail, context: TriggerContext) {
-  const subredditName =
-    event.conversationSubreddit?.name ??
-    event.destinationSubreddit?.name ??
-    "";
+  const subredditName = resolveEventSubredditName(event, context);
 
   if (!subredditName || !isMonitoredSubreddit(subredditName)) {
     console.log(`Skipping modmail for unmonitored subreddit "${subredditName || "unknown"}".`);
@@ -1115,30 +1163,47 @@ async function sendModMailToWebhook(event: ModMail, context: TriggerContext) {
 
   const conversationId = event.conversationId ?? "";
   const actualConversationId = conversationId.replace("ModmailConversation_", "");
-  const result = await context.reddit.modMail.getConversation({
-    conversationId,
-    markRead: false,
-  });
+  const modmailLink = `https://reddit.com/mail/all/${actualConversationId}`;
 
-  const isModDiscussion = result.conversation?.isInternal ?? false;
-  if (onlyModDiscussions && !isModDiscussion) {
-    console.log("Skipping regular modmail because only mod discussions are enabled.");
-    return;
+  let conversationSubject = "Modmail";
+  let participantName = "N/A";
+  let isModDiscussion = event.conversationType === "internal";
+  let message: MessageData | undefined;
+
+  try {
+    const result = await context.reddit.modMail.getConversation({
+      conversationId,
+      markRead: false,
+    });
+
+    isModDiscussion = result.conversation?.isInternal ?? isModDiscussion;
+    conversationSubject = result.conversation?.subject ?? conversationSubject;
+    participantName = result.conversation?.participant?.name ?? participantName;
+
+    const messages = result.conversation?.messages ?? {};
+    message =
+      (event.messageId ? messages[event.messageId] : undefined) ??
+      (() => {
+        const messageIds = Object.keys(messages);
+        const lastMessageId =
+          messageIds.length > 0 ? messageIds[messageIds.length - 1] : undefined;
+        return lastMessageId ? messages[lastMessageId] : undefined;
+      })();
+  } catch (error) {
+    console.error("getConversation failed, falling back to ModMail event data:", getErrorMessage(error));
   }
 
-  const modmailLink = `https://reddit.com/mail/all/${actualConversationId}`;
-  const messages = result.conversation?.messages ?? {};
-  const message: MessageData | undefined =
-    (event.messageId ? messages[event.messageId] : undefined) ??
-    (() => {
-      const messageIds = Object.keys(messages);
-      const lastMessageId =
-        messageIds.length > 0 ? messageIds[messageIds.length - 1] : undefined;
-      return lastMessageId ? messages[lastMessageId] : undefined;
-    })();
-
   if (!message) {
-    console.error("No messages found");
+    message = {
+      author: event.messageAuthor?.name ? { name: event.messageAuthor.name } : undefined,
+      participatingAs: event.messageAuthorType,
+      bodyMarkdown: "",
+      isInternal: event.conversationType === "internal",
+    };
+  }
+
+  if (onlyModDiscussions && !isModDiscussion) {
+    console.log("Skipping regular modmail because only mod discussions are enabled.");
     return;
   }
 
@@ -1147,15 +1212,14 @@ async function sendModMailToWebhook(event: ModMail, context: TriggerContext) {
   const body = message.bodyMarkdown ?? message.body ?? "";
   const participatingAs =
     message.participatingAs ?? event.messageAuthorType ?? "Unknown";
-  const participantName = result.conversation?.participant?.name ?? "N/A";
-  const isPrivateNote = message.isInternal ?? false;
+  const isPrivateNote = message.isInternal ?? event.conversationType === "internal";
 
   if (ignoreList.includes(authorName.toLowerCase())) {
     console.log(`User "${authorName}" is in the ignore list. Skipping webhook.`);
     return;
   }
 
-  if (participatingAs === "moderator" && !outgoing) {
+  if (participatingAs.toLowerCase() === "moderator" && !outgoing) {
     console.log("Not sending outgoing messages to the webhook");
     return;
   }
@@ -1165,7 +1229,7 @@ async function sendModMailToWebhook(event: ModMail, context: TriggerContext) {
     content: rolePing ? `<@&${rolePing}>` : undefined,
     embeds: [
       {
-        title: truncateTitle(result.conversation?.subject ?? "Modmail"),
+        title: truncateTitle(conversationSubject),
         url: modmailLink,
         author: {
           name: authorName,
@@ -1189,7 +1253,7 @@ async function sendModMailToWebhook(event: ModMail, context: TriggerContext) {
           },
           {
             name: "Message Preview",
-            value: truncateField(previewText(body)),
+            value: truncateField(previewText(body) || "(No message body)"),
           },
         ],
         color: isPrivateNote ? PRIVATE_NOTE_GREEN : SPECTRUM_BLUE,
