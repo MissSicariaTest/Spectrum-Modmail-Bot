@@ -2,7 +2,9 @@ import {
   AutomoderatorFilterComment,
   AutomoderatorFilterPost,
   CommentReport,
+  CommentSubmit,
   MessageData,
+  ModAction,
   ModMail,
   PostReport,
   PostSubmit,
@@ -30,23 +32,62 @@ const FIELD_LENGTH = 1024;
 const REPORT_TIMEZONE = "America/New_York";
 const REPORT_HOUR = 8;
 const DAILY_REPORT_JOB_NAME = "dailyReport";
-const DAILY_STATS_TTL_SECONDS = 60 * 60 * 24 * 14;
+const DAILY_REPORT_KV_KEY = "dailyReport:data";
+const DAILY_REPORT_CRON_KV_KEY = "dailyReport:cronJobId";
+const DAILY_REPORT_SENT_KV_KEY = "dailyReport:lastSentDate";
 const MONITORED_SUBREDDITS = ["spectrum", "spectrum_official"] as const;
 
+const MOD_QUEUE_APPROVE_ACTIONS = new Set(["approvelink", "approvecomment"]);
+const MOD_QUEUE_REMOVE_ACTIONS = new Set([
+  "removelink",
+  "removecomment",
+  "spamlink",
+  "spamcomment",
+]);
+
+type MonitoredSubreddit = (typeof MONITORED_SUBREDDITS)[number];
 type WebhookCategory = "modmail" | "modqueue" | "newposts";
 
-type DailyStatField =
-  | "modmail"
-  | "modmail_private"
-  | "modqueue_reported_post"
-  | "modqueue_reported_comment"
-  | "modqueue_automod_post"
-  | "modqueue_automod_comment"
-  | "newposts";
+type SubredditMetrics = {
+  modmailReceived: number;
+  newPostsSubmitted: number;
+  modQueueFlagged: number;
+  postsWithModResponse: number;
+  postsWithoutModResponse: number;
+  modmailResponseTimeTotalMs: number;
+  modmailResponseTimeSamples: number;
+  postResponseTimeTotalMs: number;
+  postResponseTimeSamples: number;
+  modmailResolved: number;
+  modmailUnresolved: number;
+  modmailAbandoned: number;
+  modQueueApproved: number;
+  modQueueRemoved: number;
+  postsLive: number;
+  postsRemoved: number;
+};
 
-type DailyActivity = {
-  label: string;
-  url: string;
+type ModmailConversationTracking = {
+  subreddit: MonitoredSubreddit;
+  firstUserMessageAt: number;
+  lastUserMessageAt: number;
+  lastModReplyAt: number | null;
+  modReplied: boolean;
+  resolved: boolean;
+};
+
+type PostTracking = {
+  subreddit: MonitoredSubreddit;
+  submittedAt: number;
+  hasModResponse: boolean;
+  isLive: boolean;
+};
+
+type DailyReportStore = {
+  periodStartedAt: string;
+  subreddits: Record<MonitoredSubreddit, SubredditMetrics>;
+  modmailConversations: Record<string, ModmailConversationTracking>;
+  trackedPosts: Record<string, PostTracking>;
 };
 
 type DiscordEmbedField = {
@@ -66,6 +107,9 @@ type DiscordEmbed = {
   fields?: DiscordEmbedField[];
   color?: number;
   timestamp?: string;
+  footer?: {
+    text: string;
+  };
 };
 
 type DiscordWebhookPayload = {
@@ -76,7 +120,7 @@ type DiscordWebhookPayload = {
 Devvit.configure({
   http: true,
   redditAPI: true,
-  redis: true,
+  kvStore: true,
 });
 
 Devvit.addSettings([
@@ -153,6 +197,7 @@ Devvit.addTrigger({
       if (!context) {
         throw new Error("Context is probably undefined");
       }
+      await trackModMailForReport(event, context);
       await sendModMailToWebhook(event, context);
     } catch (error) {
       console.error(
@@ -175,6 +220,8 @@ Devvit.addTrigger({
       if (!context) {
         throw new Error("Context is probably undefined");
       }
+
+      await trackModQueueForReport(event, context);
 
       switch (event.type) {
         case "PostReport":
@@ -208,10 +255,45 @@ Devvit.addTrigger({
       if (!context) {
         throw new Error("Context is probably undefined");
       }
+      await trackPostSubmitForReport(event, context);
       await sendNewPostAlert(event, context);
     } catch (error) {
       console.error(
         "PostSubmit trigger error:",
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  },
+});
+
+Devvit.addTrigger({
+  event: "CommentSubmit",
+  onEvent: async (event: CommentSubmit, context: TriggerContext) => {
+    try {
+      if (!context) {
+        throw new Error("Context is probably undefined");
+      }
+      await trackCommentSubmitForReport(event, context);
+    } catch (error) {
+      console.error(
+        "CommentSubmit trigger error:",
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  },
+});
+
+Devvit.addTrigger({
+  event: "ModAction",
+  onEvent: async (event: ModAction, context: TriggerContext) => {
+    try {
+      if (!context) {
+        throw new Error("Context is probably undefined");
+      }
+      await trackModActionForReport(event, context);
+    } catch (error) {
+      console.error(
+        "ModAction trigger error:",
         error instanceof Error ? error.message : String(error)
       );
     }
@@ -334,10 +416,6 @@ function toPostId(id: string): string {
   return id.startsWith("t3_") ? id : `t3_${id}`;
 }
 
-function toCommentId(id: string): string {
-  return id.startsWith("t1_") ? id : `t1_${id}`;
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -355,13 +433,6 @@ function getDateKeyInTimezone(date: Date, timeZone: string): string {
   }).format(date);
 }
 
-function getPreviousDateKey(dateKey: string): string {
-  const [year, month, day] = dateKey.split("-").map(Number);
-  const date = new Date(Date.UTC(year, month - 1, day));
-  date.setUTCDate(date.getUTCDate() - 1);
-  return date.toISOString().slice(0, 10);
-}
-
 function getLocalHour(date: Date, timeZone: string): number {
   const hour = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -371,73 +442,468 @@ function getLocalHour(date: Date, timeZone: string): number {
   return Number.parseInt(hour, 10);
 }
 
-function formatReportDate(dateKey: string): string {
-  const [year, month, day] = dateKey.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-US", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  }).format(new Date(year, month - 1, day));
-}
-
 function displaySubredditLabel(subreddit: string): string {
   return subreddit === "spectrum_official" ? "r/Spectrum_Official" : "r/Spectrum";
 }
 
-function dailyStatsKey(dateKey: string, subreddit: string): string {
-  return `daily:stats:${dateKey}:${subreddit}`;
+function getMonitoredSubredditKey(subredditName: string): MonitoredSubreddit | null {
+  const normalized = normalizeSubredditName(subredditName);
+  if (normalized === "spectrum" || normalized === "spectrum_official") {
+    return normalized;
+  }
+  return null;
 }
 
-function dailyActivityKey(dateKey: string, subreddit: string): string {
-  return `daily:activity:${dateKey}:${subreddit}`;
+function emptyMetrics(): SubredditMetrics {
+  return {
+    modmailReceived: 0,
+    newPostsSubmitted: 0,
+    modQueueFlagged: 0,
+    postsWithModResponse: 0,
+    postsWithoutModResponse: 0,
+    modmailResponseTimeTotalMs: 0,
+    modmailResponseTimeSamples: 0,
+    postResponseTimeTotalMs: 0,
+    postResponseTimeSamples: 0,
+    modmailResolved: 0,
+    modmailUnresolved: 0,
+    modmailAbandoned: 0,
+    modQueueApproved: 0,
+    modQueueRemoved: 0,
+    postsLive: 0,
+    postsRemoved: 0,
+  };
 }
 
-function parseStatValue(stats: Record<string, string>, field: DailyStatField): number {
-  return Number.parseInt(stats[field] ?? "0", 10) || 0;
+function createEmptyDailyReportStore(): DailyReportStore {
+  return {
+    periodStartedAt: new Date().toISOString(),
+    subreddits: {
+      spectrum: emptyMetrics(),
+      spectrum_official: emptyMetrics(),
+    },
+    modmailConversations: {},
+    trackedPosts: {},
+  };
 }
 
-function buildSubredditSummary(stats: Record<string, string>): string {
-  const modmail = parseStatValue(stats, "modmail");
-  const modmailPrivate = parseStatValue(stats, "modmail_private");
-  const reportedPosts = parseStatValue(stats, "modqueue_reported_post");
-  const reportedComments = parseStatValue(stats, "modqueue_reported_comment");
-  const automodPosts = parseStatValue(stats, "modqueue_automod_post");
-  const automodComments = parseStatValue(stats, "modqueue_automod_comment");
-  const newPosts = parseStatValue(stats, "newposts");
+async function getDailyReportStore(context: JobContext | TriggerContext): Promise<DailyReportStore> {
+  const stored = await context.kvStore.get<DailyReportStore>(DAILY_REPORT_KV_KEY);
+  if (!stored?.subreddits) {
+    return createEmptyDailyReportStore();
+  }
 
-  const modmailLine =
-    modmailPrivate > 0
-      ? `Modmail: ${modmail} (${modmailPrivate} private note${modmailPrivate === 1 ? "" : "s"})`
-      : `Modmail: ${modmail}`;
+  return {
+    ...createEmptyDailyReportStore(),
+    ...stored,
+    subreddits: {
+      spectrum: { ...emptyMetrics(), ...stored.subreddits.spectrum },
+      spectrum_official: { ...emptyMetrics(), ...stored.subreddits.spectrum_official },
+    },
+    modmailConversations: stored.modmailConversations ?? {},
+    trackedPosts: stored.trackedPosts ?? {},
+  };
+}
+
+async function saveDailyReportStore(
+  context: JobContext | TriggerContext,
+  store: DailyReportStore
+): Promise<void> {
+  await context.kvStore.put(DAILY_REPORT_KV_KEY, store);
+}
+
+async function resetDailyReportStore(context: JobContext | TriggerContext): Promise<void> {
+  await context.kvStore.put(DAILY_REPORT_KV_KEY, createEmptyDailyReportStore());
+}
+
+function getMetrics(store: DailyReportStore, subreddit: MonitoredSubreddit): SubredditMetrics {
+  return store.subreddits[subreddit];
+}
+
+function formatDuration(ms: number): string {
+  if (ms <= 0) {
+    return "N/A";
+  }
+
+  const totalMinutes = Math.round(ms / 60_000);
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m`;
+  }
+
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+function formatAverageDuration(totalMs: number, samples: number): string {
+  if (samples <= 0) {
+    return "N/A";
+  }
+  return formatDuration(totalMs / samples);
+}
+
+function formatReportGeneratedAt(date: Date): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: REPORT_TIMEZONE,
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(date);
+}
+
+function formatReportingPeriod(store: DailyReportStore, generatedAt: Date): string {
+  const end = generatedAt.toISOString();
+  return `${store.periodStartedAt} to ${end}`;
+}
+
+function finalizeModmailConversationMetrics(store: DailyReportStore): void {
+  for (const subreddit of MONITORED_SUBREDDITS) {
+    getMetrics(store, subreddit).modmailUnresolved = 0;
+    getMetrics(store, subreddit).modmailAbandoned = 0;
+  }
+
+  for (const conversation of Object.values(store.modmailConversations)) {
+    if (conversation.resolved) {
+      continue;
+    }
+
+    const metrics = getMetrics(store, conversation.subreddit);
+    if (!conversation.modReplied) {
+      metrics.modmailUnresolved += 1;
+      continue;
+    }
+
+    if (
+      conversation.lastModReplyAt !== null &&
+      conversation.lastModReplyAt >= conversation.lastUserMessageAt
+    ) {
+      metrics.modmailAbandoned += 1;
+      continue;
+    }
+
+    metrics.modmailUnresolved += 1;
+  }
+}
+
+function reconcilePostMetrics(store: DailyReportStore): void {
+  for (const subreddit of MONITORED_SUBREDDITS) {
+    const metrics = getMetrics(store, subreddit);
+    metrics.postsWithModResponse = 0;
+    metrics.postsWithoutModResponse = 0;
+    metrics.postsLive = 0;
+    metrics.postsRemoved = 0;
+  }
+
+  for (const post of Object.values(store.trackedPosts)) {
+    const metrics = getMetrics(store, post.subreddit);
+    if (post.hasModResponse) {
+      metrics.postsWithModResponse += 1;
+    } else {
+      metrics.postsWithoutModResponse += 1;
+    }
+
+    if (post.isLive) {
+      metrics.postsLive += 1;
+    } else {
+      metrics.postsRemoved += 1;
+    }
+  }
+}
+
+function buildSubredditReportFields(
+  subreddit: MonitoredSubreddit,
+  metrics: SubredditMetrics
+): DiscordEmbedField[] {
+  const label = displaySubredditLabel(subreddit);
 
   return [
-    modmailLine,
-    `Mod Queue: ${reportedPosts} reported post${reportedPosts === 1 ? "" : "s"}, ${reportedComments} reported comment${reportedComments === 1 ? "" : "s"}, ${automodPosts} AutoMod post${automodPosts === 1 ? "" : "s"}, ${automodComments} AutoMod comment${automodComments === 1 ? "" : "s"}`,
-    `New Posts: ${newPosts}`,
-  ].join("\n");
+    {
+      name: `${label} — New Modmail Messages`,
+      value: truncateField(String(metrics.modmailReceived)),
+      inline: true,
+    },
+    {
+      name: `${label} — New Posts Submitted`,
+      value: truncateField(String(metrics.newPostsSubmitted)),
+      inline: true,
+    },
+    {
+      name: `${label} — Mod Queue Items Flagged`,
+      value: truncateField(String(metrics.modQueueFlagged)),
+      inline: true,
+    },
+    {
+      name: `${label} — Posts With Mod Response`,
+      value: truncateField(String(metrics.postsWithModResponse)),
+      inline: true,
+    },
+    {
+      name: `${label} — Posts Without Mod Response`,
+      value: truncateField(String(metrics.postsWithoutModResponse)),
+      inline: true,
+    },
+    {
+      name: `${label} — Avg Modmail Response Time`,
+      value: truncateField(
+        formatAverageDuration(
+          metrics.modmailResponseTimeTotalMs,
+          metrics.modmailResponseTimeSamples
+        )
+      ),
+      inline: true,
+    },
+    {
+      name: `${label} — Avg Post Response Time`,
+      value: truncateField(
+        formatAverageDuration(metrics.postResponseTimeTotalMs, metrics.postResponseTimeSamples)
+      ),
+      inline: true,
+    },
+    {
+      name: `${label} — Modmail Resolved`,
+      value: truncateField(String(metrics.modmailResolved)),
+      inline: true,
+    },
+    {
+      name: `${label} — Modmail Unresolved`,
+      value: truncateField(String(metrics.modmailUnresolved)),
+      inline: true,
+    },
+    {
+      name: `${label} — Modmail Abandoned`,
+      value: truncateField(String(metrics.modmailAbandoned)),
+      inline: true,
+    },
+    {
+      name: `${label} — Mod Queue Approved`,
+      value: truncateField(String(metrics.modQueueApproved)),
+      inline: true,
+    },
+    {
+      name: `${label} — Mod Queue Removed`,
+      value: truncateField(String(metrics.modQueueRemoved)),
+      inline: true,
+    },
+    {
+      name: `${label} — Posts Still Live`,
+      value: truncateField(String(metrics.postsLive)),
+      inline: true,
+    },
+    {
+      name: `${label} — Posts Removed`,
+      value: truncateField(String(metrics.postsRemoved)),
+      inline: true,
+    },
+  ];
 }
 
-async function recordDailyActivity(
-  context: TriggerContext,
-  subredditName: string,
-  stat: DailyStatField,
-  activity?: DailyActivity
-): Promise<void> {
-  const subreddit = normalizeSubredditName(subredditName);
-  const dateKey = getDateKeyInTimezone(new Date(), REPORT_TIMEZONE);
-  const statsKey = dailyStatsKey(dateKey, subreddit);
-
-  await context.redis.global.hIncrBy(statsKey, stat, 1);
-  await context.redis.global.expire(statsKey, DAILY_STATS_TTL_SECONDS);
-
-  if (activity) {
-    const activityKey = dailyActivityKey(dateKey, subreddit);
-    await context.redis.global.zAdd(activityKey, {
-      member: truncateField(`${activity.label}|${activity.url}`),
-      score: Date.now(),
-    });
-    await context.redis.global.expire(activityKey, DAILY_STATS_TTL_SECONDS);
+async function trackModMailForReport(event: ModMail, context: TriggerContext): Promise<void> {
+  const subredditName =
+    event.conversationSubreddit?.name ?? event.destinationSubreddit?.name ?? "";
+  const subreddit = getMonitoredSubredditKey(subredditName);
+  if (!subreddit) {
+    return;
   }
+
+  const conversationId = event.conversationId;
+  if (!conversationId) {
+    return;
+  }
+
+  const store = await getDailyReportStore(context);
+  const metrics = getMetrics(store, subreddit);
+  const participatingAs = event.messageAuthorType ?? "";
+  const isModeratorMessage = participatingAs === "moderator";
+  const isUserMessage = participatingAs === "participant_user";
+  const now = Date.now();
+
+  if (isUserMessage) {
+    metrics.modmailReceived += 1;
+
+    const existing = store.modmailConversations[conversationId];
+    if (existing) {
+      existing.lastUserMessageAt = now;
+    } else {
+      store.modmailConversations[conversationId] = {
+        subreddit,
+        firstUserMessageAt: now,
+        lastUserMessageAt: now,
+        lastModReplyAt: null,
+        modReplied: false,
+        resolved: false,
+      };
+    }
+  }
+
+  if (isModeratorMessage) {
+    const conversation = store.modmailConversations[conversationId];
+    if (conversation && !conversation.modReplied) {
+      const responseMs = now - conversation.lastUserMessageAt;
+      if (responseMs >= 0) {
+        metrics.modmailResponseTimeTotalMs += responseMs;
+        metrics.modmailResponseTimeSamples += 1;
+      }
+      conversation.modReplied = true;
+      conversation.lastModReplyAt = now;
+    } else if (conversation) {
+      conversation.lastModReplyAt = now;
+    }
+  }
+
+  const conversationState = (event.conversationState ?? "").toLowerCase();
+  if (conversationState === "archived") {
+    const conversation = store.modmailConversations[conversationId];
+    if (conversation && !conversation.resolved) {
+      conversation.resolved = true;
+      metrics.modmailResolved += 1;
+    }
+  }
+
+  await saveDailyReportStore(context, store);
+}
+
+async function trackModQueueForReport(
+  event:
+    | ({ type: "PostReport" } & PostReport)
+    | ({ type: "CommentReport" } & CommentReport)
+    | ({ type: "AutomoderatorFilterPost" } & AutomoderatorFilterPost)
+    | ({ type: "AutomoderatorFilterComment" } & AutomoderatorFilterComment),
+  context: TriggerContext
+): Promise<void> {
+  const subredditName = event.subreddit?.name ?? "";
+  const subreddit = getMonitoredSubredditKey(subredditName);
+  if (!subreddit) {
+    return;
+  }
+
+  const store = await getDailyReportStore(context);
+  getMetrics(store, subreddit).modQueueFlagged += 1;
+  await saveDailyReportStore(context, store);
+}
+
+async function trackPostSubmitForReport(
+  event: PostSubmit,
+  context: TriggerContext
+): Promise<void> {
+  const subredditName = event.subreddit?.name ?? "";
+  const post = event.post;
+  const subreddit = getMonitoredSubredditKey(subredditName);
+
+  if (!subreddit || !post) {
+    return;
+  }
+
+  const store = await getDailyReportStore(context);
+  const metrics = getMetrics(store, subreddit);
+  const postId = toPostId(post.id);
+
+  metrics.newPostsSubmitted += 1;
+  metrics.postsWithoutModResponse += 1;
+
+  let isLive = true;
+  try {
+    const livePost = await context.reddit.getPostById(postId);
+    isLive = !livePost.removed;
+  } catch (error) {
+    console.error("Error checking post status for report tracking:", getErrorMessage(error));
+  }
+
+  if (isLive) {
+    metrics.postsLive += 1;
+  } else {
+    metrics.postsRemoved += 1;
+    metrics.postsWithoutModResponse -= 1;
+  }
+
+  store.trackedPosts[postId] = {
+    subreddit,
+    submittedAt: Date.now(),
+    hasModResponse: false,
+    isLive,
+  };
+
+  await saveDailyReportStore(context, store);
+}
+
+async function trackCommentSubmitForReport(
+  event: CommentSubmit,
+  context: TriggerContext
+): Promise<void> {
+  const subredditName = event.subreddit?.name ?? "";
+  const subreddit = getMonitoredSubredditKey(subredditName);
+  const postId = toPostId(event.comment?.postId ?? event.post?.id ?? "");
+  const authorName = event.author?.name ?? event.comment?.author ?? "";
+
+  if (!subreddit || !postId || !authorName) {
+    return;
+  }
+
+  const author = await context.reddit.getUserByUsername(authorName);
+  if (!author) {
+    return;
+  }
+
+  const modPermissions = await author.getModPermissionsForSubreddit(
+    normalizeSubredditName(subredditName)
+  );
+  if (modPermissions.length === 0) {
+    return;
+  }
+
+  const store = await getDailyReportStore(context);
+  const trackedPost = store.trackedPosts[postId];
+  if (!trackedPost || trackedPost.hasModResponse) {
+    return;
+  }
+
+  const metrics = getMetrics(store, trackedPost.subreddit);
+  const responseMs = Date.now() - trackedPost.submittedAt;
+  if (responseMs >= 0) {
+    metrics.postResponseTimeTotalMs += responseMs;
+    metrics.postResponseTimeSamples += 1;
+  }
+
+  trackedPost.hasModResponse = true;
+  metrics.postsWithModResponse += 1;
+  metrics.postsWithoutModResponse = Math.max(0, metrics.postsWithoutModResponse - 1);
+
+  await saveDailyReportStore(context, store);
+}
+
+async function trackModActionForReport(event: ModAction, context: TriggerContext): Promise<void> {
+  const subredditName = event.subreddit?.name ?? "";
+  const subreddit = getMonitoredSubredditKey(subredditName);
+  const action = (event.action ?? "").toLowerCase();
+
+  if (!subreddit || !action) {
+    return;
+  }
+
+  const store = await getDailyReportStore(context);
+  const metrics = getMetrics(store, subreddit);
+
+  if (MOD_QUEUE_APPROVE_ACTIONS.has(action)) {
+    metrics.modQueueApproved += 1;
+  }
+
+  if (MOD_QUEUE_REMOVE_ACTIONS.has(action)) {
+    metrics.modQueueRemoved += 1;
+  }
+
+  const postId = event.targetPost?.id ? toPostId(event.targetPost.id) : null;
+  if (postId && store.trackedPosts[postId] && MOD_QUEUE_REMOVE_ACTIONS.has(action)) {
+    const trackedPost = store.trackedPosts[postId];
+    if (trackedPost.isLive) {
+      trackedPost.isLive = false;
+      metrics.postsLive = Math.max(0, metrics.postsLive - 1);
+      metrics.postsRemoved += 1;
+    }
+  }
+
+  await saveDailyReportStore(context, store);
 }
 
 async function getReportingWebhook(context: JobContext | TriggerContext): Promise<string | null> {
@@ -456,7 +922,7 @@ async function getReportingWebhook(context: JobContext | TriggerContext): Promis
 }
 
 async function ensureDailyReportScheduled(context: TriggerContext): Promise<void> {
-  const existingJobId = await context.redis.global.get("daily:report:cronJobId");
+  const existingJobId = await context.kvStore.get<string>(DAILY_REPORT_CRON_KV_KEY);
   if (existingJobId) {
     return;
   }
@@ -466,7 +932,7 @@ async function ensureDailyReportScheduled(context: TriggerContext): Promise<void
     cron: "0 * * * *",
   });
 
-  await context.redis.global.set("daily:report:cronJobId", cronJobId);
+  await context.kvStore.put(DAILY_REPORT_CRON_KV_KEY, cronJobId);
 }
 
 async function maybeSendDailyReport(context: JobContext): Promise<void> {
@@ -476,102 +942,49 @@ async function maybeSendDailyReport(context: JobContext): Promise<void> {
   }
 
   const todayKey = getDateKeyInTimezone(now, REPORT_TIMEZONE);
-  const sentKey = `daily:report:sent:${todayKey}`;
-  if (await context.redis.global.get(sentKey)) {
+  const lastSentDate = await context.kvStore.get<string>(DAILY_REPORT_SENT_KV_KEY);
+  if (lastSentDate === todayKey) {
     return;
   }
 
-  const reportDateKey = getPreviousDateKey(todayKey);
-  await sendDailyReport(context, reportDateKey);
-  await context.redis.global.set(sentKey, "1");
-  await context.redis.global.expire(sentKey, 60 * 60 * 48);
+  await sendDailyReport(context);
+  await context.kvStore.put(DAILY_REPORT_SENT_KV_KEY, todayKey);
+  await resetDailyReportStore(context);
 }
 
-async function sendDailyReport(context: JobContext, reportDateKey: string): Promise<void> {
+async function sendDailyReport(context: JobContext): Promise<void> {
   const webhook = await getReportingWebhook(context);
   if (!webhook) {
     return;
   }
 
-  const fields: DiscordEmbedField[] = [];
-  const totals = {
-    modmail: 0,
-    modmailPrivate: 0,
-    reportedPosts: 0,
-    reportedComments: 0,
-    automodPosts: 0,
-    automodComments: 0,
-    newPosts: 0,
+  const store = await getDailyReportStore(context);
+  finalizeModmailConversationMetrics(store);
+  reconcilePostMetrics(store);
+
+  const generatedAt = new Date();
+  const footerText = truncateField(`Report generated ${formatReportGeneratedAt(generatedAt)}`);
+  const periodField: DiscordEmbedField = {
+    name: "Reporting Period",
+    value: truncateField(formatReportingPeriod(store, generatedAt)),
   };
-
-  for (const subreddit of MONITORED_SUBREDDITS) {
-    const stats = await context.redis.global.hGetAll(dailyStatsKey(reportDateKey, subreddit));
-    const modmail = parseStatValue(stats, "modmail");
-    const modmailPrivate = parseStatValue(stats, "modmail_private");
-    const reportedPosts = parseStatValue(stats, "modqueue_reported_post");
-    const reportedComments = parseStatValue(stats, "modqueue_reported_comment");
-    const automodPosts = parseStatValue(stats, "modqueue_automod_post");
-    const automodComments = parseStatValue(stats, "modqueue_automod_comment");
-    const newPosts = parseStatValue(stats, "newposts");
-
-    totals.modmail += modmail;
-    totals.modmailPrivate += modmailPrivate;
-    totals.reportedPosts += reportedPosts;
-    totals.reportedComments += reportedComments;
-    totals.automodPosts += automodPosts;
-    totals.automodComments += automodComments;
-    totals.newPosts += newPosts;
-
-    fields.push({
-      name: displaySubredditLabel(subreddit),
-      value: truncateField(buildSubredditSummary(stats)),
-    });
-
-    const activities = await context.redis.global.zRange(
-      dailyActivityKey(reportDateKey, subreddit),
-      0,
-      4,
-      { by: "rank", reverse: true }
-    );
-
-    if (activities.length > 0) {
-      const highlights = activities
-        .map((entry) => {
-          const [label, url] = entry.member.split("|");
-          return url ? `[${label}](${url})` : label;
-        })
-        .join("\n");
-
-      fields.push({
-        name: `${displaySubredditLabel(subreddit)} Highlights`,
-        value: truncateField(highlights || "No highlights recorded."),
-      });
-    }
-  }
-
-  const totalSummary = [
-    totals.modmailPrivate > 0
-      ? `Modmail: ${totals.modmail} (${totals.modmailPrivate} private note${totals.modmailPrivate === 1 ? "" : "s"})`
-      : `Modmail: ${totals.modmail}`,
-    `Mod Queue: ${totals.reportedPosts} reported posts, ${totals.reportedComments} reported comments, ${totals.automodPosts} AutoMod posts, ${totals.automodComments} AutoMod comments`,
-    `New Posts: ${totals.newPosts}`,
-  ].join("\n");
-
-  fields.push({
-    name: "Combined Totals",
-    value: truncateField(totalSummary),
-  });
 
   const payload: DiscordWebhookPayload = {
     embeds: [
       {
-        title: truncateTitle(`Daily Report — ${formatReportDate(reportDateKey)}`),
-        description: truncateDescription(
-          `Summary of moderation activity for ${formatReportDate(reportDateKey)} (${REPORT_TIMEZONE}).`
-        ),
-        fields,
+        title: truncateTitle("Daily Moderation Report"),
+        fields: [periodField, ...buildSubredditReportFields("spectrum", getMetrics(store, "spectrum"))],
         color: SPECTRUM_BLUE,
-        timestamp: new Date().toISOString(),
+        footer: { text: footerText },
+      },
+      {
+        title: truncateTitle("Daily Moderation Report — r/Spectrum_Official"),
+        fields: buildSubredditReportFields(
+          "spectrum_official",
+          getMetrics(store, "spectrum_official")
+        ),
+        color: SPECTRUM_BLUE,
+        footer: { text: footerText },
       },
     ],
   };
@@ -770,14 +1183,6 @@ async function sendModMailToWebhook(event: ModMail, context: TriggerContext) {
   };
 
   await sendDiscordWebhook(webhook, payload);
-
-  await recordDailyActivity(context, subredditName, "modmail", {
-    label: result.conversation?.subject ?? "Modmail",
-    url: modmailLink,
-  });
-  if (isPrivateNote) {
-    await recordDailyActivity(context, subredditName, "modmail_private");
-  }
 }
 
 async function sendModQueueEmbed(
@@ -791,7 +1196,6 @@ async function sendModQueueEmbed(
     reason: string;
     contentPreview: string;
     isAutomod: boolean;
-    statField: DailyStatField;
   }
 ): Promise<void> {
   if (!isMonitoredSubreddit(subredditName)) {
@@ -852,11 +1256,6 @@ async function sendModQueueEmbed(
   };
 
   await sendDiscordWebhook(webhook, payload);
-
-  await recordDailyActivity(context, subredditName, options.statField, {
-    label: options.title,
-    url: options.url,
-  });
 }
 
 async function sendModQueueAlertFromPostReport(
@@ -884,7 +1283,6 @@ async function sendModQueueAlertFromPostReport(
     reason: event.reason,
     contentPreview,
     isAutomod: false,
-    statField: "modqueue_reported_post",
   });
 }
 
@@ -911,7 +1309,6 @@ async function sendModQueueAlertFromCommentReport(
     reason: event.reason,
     contentPreview,
     isAutomod: false,
-    statField: "modqueue_reported_comment",
   });
 }
 
@@ -939,7 +1336,6 @@ async function sendModQueueAlertFromAutomodPost(
     reason: event.reason,
     contentPreview,
     isAutomod: true,
-    statField: "modqueue_automod_post",
   });
 }
 
@@ -966,7 +1362,6 @@ async function sendModQueueAlertFromAutomodComment(
     reason: event.reason,
     contentPreview,
     isAutomod: true,
-    statField: "modqueue_automod_comment",
   });
 }
 
@@ -1044,11 +1439,6 @@ async function sendNewPostAlert(event: PostSubmit, context: TriggerContext) {
   };
 
   await sendDiscordWebhook(webhook, payload);
-
-  await recordDailyActivity(context, subredditName, "newposts", {
-    label: post.title,
-    url: postUrl,
-  });
 }
 
 export default Devvit;

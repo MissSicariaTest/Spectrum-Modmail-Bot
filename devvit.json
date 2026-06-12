@@ -6,6 +6,8 @@
       "onAppInstall",
       "onAppUpgrade",
       "onModMail",
+      "onModAction",
+      "onCommentSubmit",
       "onPostReport",
       "onCommentReport",
       "onAutomoderatorFilterPost",
