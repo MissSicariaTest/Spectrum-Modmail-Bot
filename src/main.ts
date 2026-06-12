@@ -233,8 +233,9 @@ Devvit.addTrigger({
       if (!context) {
         throw new Error("Context is probably undefined");
       }
-      await trackModMailForReport(event, context);
+      console.log(`ModMail trigger fired for conversation ${event.conversationId}`);
       await sendModMailToWebhook(event, context);
+      await safeTrack("ModMail", () => trackModMailForReport(event, context));
     } catch (error) {
       console.error(
         "ModMail trigger error:",
@@ -257,8 +258,6 @@ Devvit.addTrigger({
         throw new Error("Context is probably undefined");
       }
 
-      await trackModQueueForReport(event, context);
-
       switch (event.type) {
         case "PostReport":
           await sendModQueueAlertFromPostReport(event, context);
@@ -275,6 +274,8 @@ Devvit.addTrigger({
         default:
           console.error("Unhandled mod queue event type");
       }
+
+      await safeTrack("Mod queue", () => trackModQueueForReport(event, context));
     } catch (error) {
       console.error(
         "Mod queue trigger error:",
@@ -291,8 +292,8 @@ Devvit.addTrigger({
       if (!context) {
         throw new Error("Context is probably undefined");
       }
-      await trackPostSubmitForReport(event, context);
       await sendNewPostAlert(event, context);
+      await safeTrack("PostSubmit", () => trackPostSubmitForReport(event, context));
     } catch (error) {
       console.error(
         "PostSubmit trigger error:",
@@ -309,7 +310,7 @@ Devvit.addTrigger({
       if (!context) {
         throw new Error("Context is probably undefined");
       }
-      await trackCommentSubmitForReport(event, context);
+      await safeTrack("CommentSubmit", () => trackCommentSubmitForReport(event, context));
     } catch (error) {
       console.error(
         "CommentSubmit trigger error:",
@@ -326,7 +327,7 @@ Devvit.addTrigger({
       if (!context) {
         throw new Error("Context is probably undefined");
       }
-      await trackModActionForReport(event, context);
+      await safeTrack("ModAction", () => trackModActionForReport(event, context));
     } catch (error) {
       console.error(
         "ModAction trigger error:",
@@ -486,6 +487,14 @@ function sleep(ms: number): Promise<void> {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function safeTrack(label: string, track: () => Promise<void>): Promise<void> {
+  try {
+    await track();
+  } catch (error) {
+    console.error(`${label} tracking failed:`, getErrorMessage(error));
+  }
 }
 
 function getDateKeyInTimezone(date: Date, timeZone: string): string {
