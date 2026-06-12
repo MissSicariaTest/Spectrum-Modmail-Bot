@@ -2,6 +2,13 @@
   "name": "modmailtodiscord",
   "blocks": {
     "entry": "src/main.ts",
-    "triggers": ["onModMail"]
+    "triggers": [
+      "onModMail",
+      "onPostReport",
+      "onCommentReport",
+      "onAutomoderatorFilterPost",
+      "onAutomoderatorFilterComment",
+      "onPostSubmit"
+    ]
   }
 }
